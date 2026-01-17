@@ -46,8 +46,11 @@ Returns the final stylized `.glb` file.
 ### 4. CLI Usage
 You can run the pipeline directly from the command line without the server.
 ```bash
-python cli.py demo_cube.obj 1 --output ./my_result
+python cli.py demo_cube.obj 1
 ```
+- By default, results are saved to the `output/` folder.
+- Files are saved as `output1.glb`, `output2.glb`, etc., preserving history.
+- You can still specify a custom output directory with `--output`.
 - `demo_cube.obj`: Included sample file.
 - `1`: Style ID (1-9).
 

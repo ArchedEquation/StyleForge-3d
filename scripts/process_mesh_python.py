@@ -108,8 +108,12 @@ def process_mesh_python(input_file, output_dir, output_name):
     print(f"Saved baked content to {content_path}")
     
     # 6. Export Mesh
-    # We need to export valid OBJ or GLB with UVs.
-    export_path = os.path.join(output_dir, f"{output_name}.glb")
+    # We export as OBJ to ensure UVs are strictly preserved. 
+    # GLB export in Trimesh can implicitly strip UVs if no material/texture is present.
+    # explicit TextureVisuals ensures UVs are assigned in the object structure.
+    unwrapped_mesh.visual = trimesh.visual.TextureVisuals(uv=uvs)
+    
+    export_path = os.path.join(output_dir, f"{output_name}.obj")
     unwrapped_mesh.export(export_path)
     print(f"Exported mesh to {export_path}")
 
