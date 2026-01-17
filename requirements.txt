@@ -1,0 +1,12 @@
+fastapi
+uvicorn
+python-multipart
+torch
+torchvision
+Pillow
+numpy
+requests
+trimesh
+xatlas
+scipy
+rtree
