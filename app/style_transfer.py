@@ -72,13 +72,38 @@ def get_edge_mask(img_tensor):
     
     # Enhance contrast: values near edges should be 1, others lower.
     # The prompt requests: "Strong content loss near edges, Weakened content loss on flat regions".
-    # So we want high values at edges.
-    
-    # Maybe add a baseline so flat regions aren't 0 (which would mean NO content preservation).
-    # Let's say baseline 0.2, edges 1.0.
     mag = torch.clamp(mag * 0.8 + 0.2, 0, 1) # Simple remapping
     
     return mag.detach()
+
+def calculate_gradient_entropy(img_tensor):
+    """
+    Computes the entropy of the gradient magnitude histogram.
+    Used to monitor texture complexity.
+    """
+    with torch.no_grad():
+        # Gradients
+        dx = img_tensor[:, :, :, :-1] - img_tensor[:, :, :, 1:] # [B, C, H, W-1]
+        dy = img_tensor[:, :, :-1, :] - img_tensor[:, :, 1:, :] # [B, C, H-1, W]
+        
+        # Crop to intersection to match shapes for magnitude calculation
+        dx = dx[:, :, :-1, :] # [B, C, H-1, W-1]
+        dy = dy[:, :, :, :-1] # [B, C, H-1, W-1]
+        
+        mag = torch.sqrt(dx**2 + dy**2 + 1e-8)
+        
+        # Normalize to probability distribution (histogram)
+        # We use a soft histogram approximation or just binning
+        # For speed/differentiability not needed, just monitoring:
+        mag_flat = mag.view(-1)
+        # 100 bins
+        hist = torch.histc(mag_flat, bins=100, min=0, max=mag_flat.max())
+        p = hist / (hist.sum() + 1e-8)
+        
+        # Entropy
+        p = p[p > 0] # Remove zeros
+        entropy = -torch.sum(p * torch.log(p))
+        return entropy.item()
 
 # --- Loss Modules ---
 
@@ -116,36 +141,43 @@ class StyleLoss(nn.Module):
         return input
 
 class EdgeAwareTVLoss(nn.Module):
-    def __init__(self, weight, edge_mask):
+    def __init__(self, weight=1.0):
         super(EdgeAwareTVLoss, self).__init__()
         self.weight = weight
-        # Invert edge mask: Low weight on edges (1), High weight on flat areas (0)
-        # Actually, user wants: "Penalize smoothing only in low-gradient regions"
-        # So weight should be high where edges are weak.
-        # Mask is 1 at edges, 0 at flat. 
-        # Weight map = (1 - mask)
-        self.weight_map = (1.0 - edge_mask).detach()
         self.loss = 0
 
     def set_weight(self, w):
         self.weight = w
 
     def forward(self, input):
-        # Calculate gradients
-        h_x = input[:, :, :, :-1] - input[:, :, :, 1:]
-        h_y = input[:, :, :-1, :] - input[:, :, 1:, :]
+        # Dynamic Edge-Aware TV
+        # Compute gradients of the CURRENT input
+        # We want to penalize gradients only where they are currently low (noise).
+        # Where gradients are high (edges), we reduce the penalty to preserve them.
         
-        # We need to align the weight map with the gradients. 
-        # Gradients are 1 pixel smaller. Crop weight map? 
-        # Or Just use 'same' padding logic implicitly?
-        # Let's crop weight map to match gradient size for strict correctness.
+        # 1. Calculate Gradients
+        dx = input[:, :, :, :-1] - input[:, :, :, 1:]
+        dy = input[:, :, :-1, :] - input[:, :, 1:, :]
         
-        w_x = self.weight_map[:, :, :, 1:]
-        w_y = self.weight_map[:, :, 1:, :]
+        # 2. Calculate Magnitude (per channel or average)
+        # Averaging over channels to get a structural edge map
+        mag_x = torch.abs(dx).mean(dim=1, keepdim=True)
+        mag_y = torch.abs(dy).mean(dim=1, keepdim=True)
         
+        # 3. Dynamic Weighting (Perona-Malik / Charbonnier style)
+        # W = exp(-alpha * |grad|)
+        # alpha controls how "sharp" the cutoff is.
+        # If grad is small, exp(0) = 1 -> Full TV penalty (Smooths noise)
+        # If grad is large, exp(-large) -> 0 -> No penalty (Preserves edge)
+        alpha = 5.0 # Empirical constant for edge preservation
+        
+        w_x = torch.exp(-alpha * mag_x).detach() # Detach weights -> Don't differentiate the weight calc itself
+        w_y = torch.exp(-alpha * mag_y).detach()
+        
+        # 4. Weighted TV Loss
         self.loss = self.weight * (
-            torch.sum(torch.abs(h_x) * w_x) + 
-            torch.sum(torch.abs(h_y) * w_y)
+            torch.sum(torch.abs(dx) * w_x) + 
+            torch.sum(torch.abs(dy) * w_y)
         )
         return self.loss
 
@@ -169,35 +201,55 @@ class Normalization(nn.Module):
 # --- Model Builder ---
 
 class PatchStyleLoss(nn.Module):
-    def __init__(self, target_feature, layer_weight=1.0):
+    def __init__(self, target_feature, kernel_size=8, stride=4, layer_weight=1.0):
         super(PatchStyleLoss, self).__init__()
         self.layer_weight = layer_weight
         self.loss = 0
+        self.kernel_size = kernel_size
+        self.stride = stride
         
-        # create 2x2 grid patches
-        H, W = target_feature.shape[-2:]
-        h_mid, w_mid = H // 2, W // 2
+        # 1. Prepare Target (Style) Patches
+        # We need to extract all patches from the target feature map
+        # target_feature: [1, C, H, W]
+        # unfold -> [1, C*k*k, L]
+        p_target = F.unfold(target_feature, kernel_size=self.kernel_size, stride=self.stride)
+        p_target = p_target.permute(0, 2, 1).squeeze(0) # [L, C*k*k]
         
-        # We store the target grams for each quadrant
-        # 0: TL, 1: TR, 2: BL, 3: BR
-        self.targets = []
-        self.slices = [
-            (slice(None), slice(None), slice(0, h_mid), slice(0, w_mid)),
-            (slice(None), slice(None), slice(0, h_mid), slice(w_mid, None)),
-            (slice(None), slice(None), slice(h_mid, None), slice(0, w_mid)),
-            (slice(None), slice(None), slice(h_mid, None), slice(w_mid, None))
-        ]
+        # Normalize target patches for Cosine Similarity (L2 normalization)
+        self.target_patches = F.normalize(p_target, p=2, dim=1).detach()
         
-        for sl in self.slices:
-            self.targets.append(gram_matrix(target_feature[sl]).detach())
-
     def forward(self, input):
-        total_loss = 0
-        for i, sl in enumerate(self.slices):
-            G = gram_matrix(input[sl])
-            total_loss += F.mse_loss(G, self.targets[i])
-            
-        self.loss = self.layer_weight * (total_loss / 4.0)
+        # 1. Pad Input (Reflect) 
+        # Padding: roughly kernel_size / 2 for coverage
+        p = self.kernel_size // 2
+        input_padded = F.pad(input, (p, p, p, p), mode='reflect')
+
+        # 2. Extract Input Patches
+        # input: [B, C, H, W] -> unfold -> [B, C*k*k, L]
+        # B=1 usually
+        patches_unfolded = F.unfold(input_padded, kernel_size=self.kernel_size, stride=self.stride)
+        
+        # Reshape to [L_in, C*k*k]
+        # (Assuming Batch Size = 1)
+        input_patches = patches_unfolded.permute(0, 2, 1).squeeze(0) # [L_in, FeatureDim]
+        
+        # 3. Normalize Input Patches
+        input_norm = F.normalize(input_patches, p=2, dim=1)
+        
+        # 4. Find Nearest Neighbors
+        # Compute Cosine Similarity Matrix: [L_in, L_target]
+        # Sim = I_norm @ T_norm.T
+        similarity = torch.mm(input_norm, self.target_patches.t())
+        
+        # Find best match for each input patch
+        best_sim, best_idx = torch.max(similarity, dim=1)
+        
+        # 5. Calculate Loss
+        # We want to maximize similarity (minimize distance)
+        # Loss = mean(1 - max_similarity)
+        # This penalizes patches that are far from ANY style patch.
+        self.loss = self.layer_weight * torch.mean(1.0 - best_sim)
+        
         return input
 
 # --- Model Builder ---
@@ -247,8 +299,18 @@ def get_style_model_and_losses(cnn, normalization_mean, normalization_std,
             
             # 2. Localized Patch Style Loss (Augmenting Global)
             # Apply only to mid-levels (conv_3, conv_5) where structure matters
-            if name in ['conv_3', 'conv_5']:
-                 patch_loss = PatchStyleLoss(target_feature, layer_weight=w * 0.5) # 50% weight of global
+            # 2. Localized Patch Style Loss (Augmenting Global)
+            # Apply only to mid-levels (conv_3, conv_5) where structure matters
+            if name == 'conv_3': # ReLU2_1 (H/2)
+                 # 16px image patch -> ~8px feature patch
+                 # Stride 4 feature -> 8px image shift
+                 patch_loss = PatchStyleLoss(target_feature, kernel_size=8, stride=4, layer_weight=w * 0.5) 
+                 model.add_module("patch_style_loss_{}".format(i), patch_loss)
+                 style_losses.append(patch_loss)
+            elif name == 'conv_5': # ReLU3_1 (H/4)
+                 # 32px image patch -> ~8px feature patch
+                 # Stride 4 feature -> 16px image shift
+                 patch_loss = PatchStyleLoss(target_feature, kernel_size=8, stride=4, layer_weight=w * 0.5)
                  model.add_module("patch_style_loss_{}".format(i), patch_loss)
                  style_losses.append(patch_loss)
 
@@ -313,12 +375,18 @@ def run_optimization(model, style_losses, content_losses, tv_loss_module,
             progress = run[0] / num_steps
             base_tv = tv_start - (tv_start - tv_end) * progress
             
-            # 2. Adaptive Adjustment based on Variance
+            # 2. Adaptive Adjustment based on Variance AND Entropy
             # If variance is dropping too low (over-smoothing), reduce TV pressure
-            # If variance is high (noise), maintain or increase
+            # If noise spikes, reinforce
             with torch.no_grad():
                 var = torch.var(input_img).item()
-                if var < 0.005: 
+                entropy = calculate_gradient_entropy(input_img)
+                
+                # Logic:
+                # Low Variance + Low Entropy = Flat/Smooth -> Reduce TV to allow detail
+                # High Variance + High Entropy = Noise -> Increase TV
+                
+                if var < 0.005 or entropy < 2.5: 
                     # Dangerously smooth, reduce TV to let details form
                     current_tv_w = base_tv * 0.5 
                 elif var > 0.15:
@@ -337,7 +405,7 @@ def run_optimization(model, style_losses, content_losses, tv_loss_module,
             if run[0] % 50 == 0:
                 logger.info(f"[{phase_name}] Step {run[0]}/{num_steps}: Style: {style_score.item():.2f} "
                             f"Content: {content_score.item():.2f} TV: {tv_score.item():.4f} "
-                            f"(w={current_tv_w:.5f}, var={var:.4f}) Total: {loss.item():.2f}")
+                            f"(w={current_tv_w:.5f}, var={var:.4f}, ent={entropy:.2f}) Total: {loss.item():.2f}")
                 
             return loss
 
@@ -403,9 +471,12 @@ def run_style_transfer(content_path, style_path, output_path, num_steps=300):
                  input_img = F.interpolate(current_input, size=(res, res), mode='bilinear', align_corners=False)
                  input_img = input_img.detach().requires_grad_(True)
         
-        # Get edge mask for this resolution for TV
-        edge_mask_res = get_edge_mask(content_img_res)
-        tv_module = EdgeAwareTVLoss(1e-4, edge_mask_res)
+        # Get edge mask not needed for dynamic TV loop, but used for Content?
+        # Note: ContentLoss uses mask, TV uses dynamic gradients.
+        
+        # Initialize Dynamic EdgeAware TV
+        # No mask needed, just weight.
+        tv_module = EdgeAwareTVLoss(weight=1e-4)
 
         # Build Model for this resolution
         model, style_losses, content_losses = get_style_model_and_losses(
