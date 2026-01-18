@@ -21,18 +21,36 @@ To give the Neural Style Transfer a "structure" to latch onto, we generate a **C
 - **Normals-to-Texture**: We map the vertex normals to the UV space. This encodes the geometry's curvature and edges into color data.
 - **Interpolation**: We use `scipy.interpolate.griddata` to rasterize these vertex values into a 2D pixel grid based on the UV coordinates. This creates a smooth gradient map representing the 3D form in 2D space.
 
-## 3. Neural Style Transfer (NST)
-We implemented a custom **PyTorch** module based on the Gatys et al. optimization method, refined for texture generation.
+## 3. Advanced Neural Style Transfer (NST)
+We have moved beyond the standard Gatys et al. implementation to a **structure-aware, multi-resolution pipeline** designed specifically for 3D textures.
 
-### A. Loss Function Engineering
-- **Content Loss**: Calculated at deep layers (`conv_4`) of VGG19. This ensures the *semantic structure* (shapes, edges from the normal map) is preserved, rather than exact pixel values.
-- **Style Loss**: Calculated across multiple scales (`conv_1` to `conv_5`) using Gram Matrices. This captures the "texture" (brush strokes, color palette) of the style image.
-- **Total Variation (TV) Loss**: Added to penalize high-frequency noise. This is critical for UV textures to prevent "pixel snow" and ensure smoother transitions across the model surface.
+### A. Localized Style Matching (MRF)
+Standard NST uses Gram matrices, which destroy spatial arrangement (bag-of-features). For 3D textures, this causes "block melting."
+-   **Solution**: We implemented a **Markov Random Field (MRF)** variation.
+-   **Method**: 
+    1.  We extract all $k \times k$ patches from the Style Image to create a "Style Dictionary."
+    2.  During optimization, each patch of the canvas searches for its **Nearest Neighbor** in this dictionary using Cosine Similarity.
+    3.  The loss forces the canvas patch to become identical to its best-matching style patch.
+-   **Result**: This preserves "slabs," "strokes," and distinct geometric features of the style, essential for maintaining the look of the 3D object.
 
-### B. Optimization Strategy
-- **Initialization**: We initialize the optimization with the **Content Map** (not random noise). This drastically improves structure preservation and convergence speed.
-- **Optimizer**: We use **LBFGS** (Limited-memory BFGS), a quasi-Newton method. It consumes more memory than Adam but typically converges to a sharper, higher-quality result in fewer iterations for style transfer tasks.
-- **Weight Balancing**: weights were carefully tuned (`Style: 1e5`, `Content: 50`) so the geometry doesn't get "washed out" by the style.
+### B. Dynamic Regularization (Perona-Malik)
+Standard Total Variation (TV) loss blurs everything equally.
+-   **Upgrade**: We use **Edge-Aware Diffusion**.
+-   **Algorithm**: Gradients are calculated dynamically at every step.
+    -   $W = e^{-\alpha |\nabla I|}$
+-   **Behavior**: Smoothing is strong in flat areas (removing noise) but decays to zero near edges. This allows sharp style transitions to exist alongside smooth gradients.
+
+### C. Feedback-Driven Optimization
+The optimization loop is no longer blind. It monitors the image state in real-time:
+-   **Entropy Monitor**: Calculates the entropy of pixel gradients. Low entropy triggers a reduction in smoothing to allow details to form.
+-   **Variance Monitor**: High variance (noise spikes) triggers increased regularization.
+-   **Phased Generation**:
+    1.  **256x256**: Composition lock (using Patch Loss to establish layout).
+    2.  **512x512**: Detail refinement (upsampling and sharpening).
+
+### D. Setup
+-   **Optimizer**: **L-BFGS** (Preserved for its superior convergence on texture synthesis).
+-   **Initialization**: Content Map (Normals/AO) serves as the base, ensuring UV islands remain coherent.
 
 ## 4. Asset Packing
 The final step involves re-assembling the 3D file.

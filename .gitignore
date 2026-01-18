@@ -21,7 +21,7 @@ temp/
 output/
 test_output/
 *.log
-
+tests
 # Large Binary Files (Optional, depending on if you want to commit results)
 # *.glb
 # *.obj
