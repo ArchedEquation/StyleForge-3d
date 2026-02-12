@@ -22,11 +22,11 @@ graph TD
     API --> Controller[Pipeline Orchestrator]
     
     subgraph "Phase 1: Geometry Engine"
-    Controller --> Import[Mesh Import (Trimesh)]
-    Import --> Clean[Mesh Cleanup & Validation]
-    Clean --> Unwrap[UV Unwrapping (xatlas)]
-    Unwrap --> Bake[Normal Map Baking]
-    Bake --> ContentMap[Processed Content Map (RGB)]
+    Controller --> Import["Mesh Import (Trimesh)"]
+    Import --> Clean["Mesh Cleanup & Validation"]
+    Clean --> Unwrap["UV Unwrapping (xatlas)"]
+    Unwrap --> Bake["Normal Map Baking"]
+    Bake --> ContentMap["Processed Content Map (RGB)"]
     end
     
     subgraph "Phase 2: Neural Style Transfer Core"
