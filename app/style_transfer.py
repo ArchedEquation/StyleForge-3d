@@ -420,6 +420,8 @@ def run_style_transfer(content_path, style_path, output_path, num_steps=300):
     logger.info("Initializing Advanced 3D Style Transfer...")
 
     cnn = models.vgg19(pretrained=True).features.to(device).eval()
+    for param in cnn.parameters():
+        param.requires_grad = False
     norm_mean = torch.tensor([0.485, 0.456, 0.406]).to(device)
     norm_std = torch.tensor([0.229, 0.224, 0.225]).to(device)
 
