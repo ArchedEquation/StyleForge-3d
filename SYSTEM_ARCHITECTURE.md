@@ -45,7 +45,7 @@ graph TD
     
     subgraph "Phase 3: Asset Packaging"
     Texture --> Material[Material Generation]
-    Material --> GLB[GLB Export (Trimesh)]
+    Material --> GLB["GLB Export (Trimesh)"]
     end
     
     GLB --> Storage[File System]
